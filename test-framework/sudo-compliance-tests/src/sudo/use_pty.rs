@@ -228,213 +228,49 @@ fn stdout_pipe_tty() {
 }
 
 const POLL_ATTEMPTS: u32 = 200;
-const POLL_READY_SLEEP: &str = "0.05";
-const POLL_EARLY_SLEEP: &str = "0.02";
-const SUDO_PID_LIST: &str = "$(pidof sudo 2>/dev/null | tr ' ' '\\n' | sort -n | tr '\\n' ' ')";
-const SUDO_DEV_LOGS_TAIL: &str = "ls -1 /tmp/sudo-dev-*.log 2>/dev/null | xargs -r -n1 sh -c 'echo \"=== $1 ===\"; tail -n 200 \"$1\"' sh || true;";
+const POLL_SLEEP: &str = "0.05";
 
-fn wait_for_file(
-    file: &str,
-    sleep: &str,
-    on_timeout_message: &str,
-    prefix: &str,
-    include_ps: bool,
-) -> String {
-    let ps_dump = if include_ps {
-        "ps -o pid,ppid,pgid,sid,tty,args -C sudo || true;"
-    } else {
-        ""
-    };
+fn wait_for(file: &str, message: &str) -> String {
     format!(
         "for _ in $(seq 1 {POLL_ATTEMPTS}); do
              [ -f {file} ] && break;
-             sleep {sleep};
+             sleep {POLL_SLEEP};
          done;
-         [ -f {file} ] || {{
-             echo '{on_timeout_message}';
-             {ps_dump}
-             cat /tmp/{prefix}.log;
-             {sudo_dev_logs}
-             exit 1;
-         }};",
-        sudo_dev_logs = SUDO_DEV_LOGS_TAIL
+         [ -f {file} ] || {{ echo '{message}'; exit 1; }};"
     )
 }
 
-fn wait_for_sudo_exit(before_sudo: &str, leak_message: &str, prefix: &str) -> String {
+fn wait_for_sudo_exit() -> String {
     format!(
         "for _ in $(seq 1 {POLL_ATTEMPTS}); do
-             current_sudo=\"{sudo_list}\";
-             [ \"$current_sudo\" = \"{before_sudo}\" ] && exit 0;
-             sleep {POLL_READY_SLEEP};
+             pidof sudo >/dev/null 2>&1 || exit 0;
+             sleep {POLL_SLEEP};
          done;
-         echo '{leak_message}';
-         ps -o pid,ppid,pgid,sid,tty,args -C sudo || true;
-         cat /tmp/{prefix}.log;
-         {sudo_dev_logs}
-         exit 1",
-        sudo_list = SUDO_PID_LIST,
-        sudo_dev_logs = SUDO_DEV_LOGS_TAIL
+         echo 'sudo process leaked after tty close'; exit 1"
     )
 }
 
-fn assert_closed_tty_sends_hup(
+/// Run a command inside a PTY launcher, wait for readiness, close the PTY via
+/// SIGUSR1, then wait for an expected file to appear (e.g. a HUP marker or
+/// EIO-detection marker) and for sudo to exit.
+fn assert_closed_tty(
     env: &sudo_test::Env,
-    launcher_script: &str,
     target_script: &str,
     ready_file: &str,
-    hup_file: &str,
-    prefix: &str,
+    expected_file: &str,
 ) {
-    let wait_until_ready = wait_for_file(
-        ready_file,
-        POLL_READY_SLEEP,
-        "target not ready",
-        prefix,
-        false,
-    );
-    let wait_for_hup = wait_for_file(
-        hup_file,
-        POLL_READY_SLEEP,
-        "command did not receive SIGHUP",
-        prefix,
-        false,
-    );
-    let wait_for_sudo_exit = wait_for_sudo_exit(
-        "$before_sudo",
-        "sudo process leaked after tty close",
-        prefix,
-    );
+    let launcher = "/root/pty-launcher.sh";
+
     let command = format!(
-        "rm -f {ready_file} {hup_file} /tmp/{prefix}.pid /tmp/{prefix}.log;
-         before_sudo=\"{sudo_list}\";
-         sh {launcher_script} sudo /bin/sh {target_script} >/tmp/{prefix}.log 2>&1 &
-         echo $! >/tmp/{prefix}.pid;
-         {wait_until_ready}
-         kill -USR1 \"$(cat /tmp/{prefix}.pid)\" || true;
-         {wait_for_hup}
-         {wait_for_sudo_exit}",
-        sudo_list = SUDO_PID_LIST
-    );
-
-    Command::new("sh")
-        .args(["-c", &command])
-        .tty(true)
-        .output(env)
-        .assert_success();
-}
-
-fn assert_early_closed_tty_sends_hup(
-    env: &sudo_test::Env,
-    launcher_script: &str,
-    target_script: &str,
-    started_file: &str,
-    hup_file: &str,
-    prefix: &str,
-) {
-    let wait_until_started = wait_for_file(
-        started_file,
-        POLL_EARLY_SLEEP,
-        "target did not start",
-        prefix,
-        false,
-    );
-    let wait_for_hup = wait_for_file(
-        hup_file,
-        POLL_READY_SLEEP,
-        "command did not receive SIGHUP after early tty close",
-        prefix,
-        false,
-    );
-    let wait_for_sudo_exit = wait_for_sudo_exit(
-        "$before_sudo",
-        "sudo process leaked after early tty close",
-        prefix,
-    );
-    let command = format!(
-        "rm -f {started_file} {hup_file} /tmp/{prefix}.pid /tmp/{prefix}.log;
-         before_sudo=\"{sudo_list}\";
-         sh {launcher_script} sudo /bin/sh {target_script} >/tmp/{prefix}.log 2>&1 &
-         echo $! >/tmp/{prefix}.pid;
-         {wait_until_started}
-         kill -USR1 \"$(cat /tmp/{prefix}.pid)\" || true;
-         {wait_for_hup}
-         {wait_for_sudo_exit}",
-        sudo_list = SUDO_PID_LIST
-    );
-
-    Command::new("sh")
-        .args(["-c", &command])
-        .tty(true)
-        .output(env)
-        .assert_success();
-}
-
-fn assert_closed_tty_closes_sudo(
-    env: &sudo_test::Env,
-    launcher_script: &str,
-    target_script: &str,
-    ready_file: &str,
-    prefix: &str,
-) {
-    let wait_until_ready = wait_for_file(
-        ready_file,
-        POLL_READY_SLEEP,
-        "target not ready",
-        prefix,
-        false,
-    );
-    let wait_for_sudo_exit = wait_for_sudo_exit(
-        "$before_sudo",
-        "sudo process leaked after tty close",
-        prefix,
-    );
-    let command = format!(
-        "rm -f {ready_file} /tmp/{prefix}.pid /tmp/{prefix}.log;
-         before_sudo=\"{sudo_list}\";
-         sh {launcher_script} sudo /bin/sh {target_script} >/tmp/{prefix}.log 2>&1 &
-         echo $! >/tmp/{prefix}.pid;
-         {wait_until_ready}
-         kill -USR1 \"$(cat /tmp/{prefix}.pid)\" || true;
-         {wait_for_sudo_exit}",
-        sudo_list = SUDO_PID_LIST
-    );
-
-    Command::new("sh")
-        .args(["-c", &command])
-        .tty(true)
-        .output(env)
-        .assert_success();
-}
-
-fn assert_immediate_tty_close_after_sudo_spawn_cleans_sudo(
-    env: &sudo_test::Env,
-    launcher_script: &str,
-    target_script: &str,
-    prefix: &str,
-) {
-    let wait_for_sudo_spawn = format!(
-        "for _ in $(seq 1 {POLL_ATTEMPTS}); do
-             current_sudo=\"{sudo_list}\";
-             [ \"$current_sudo\" != \"$before_sudo\" ] && break;
-             sleep {POLL_EARLY_SLEEP};
-         done;",
-        sudo_list = SUDO_PID_LIST
-    );
-    let wait_for_sudo_exit = wait_for_sudo_exit(
-        "$before_sudo",
-        "sudo process leaked after immediate tty close",
-        prefix,
-    );
-    let command = format!(
-        "rm -f /tmp/{prefix}.pid /tmp/{prefix}.log;
-         before_sudo=\"{sudo_list}\";
-         sh {launcher_script} sudo /bin/sh {target_script} >/tmp/{prefix}.log 2>&1 &
-         echo $! >/tmp/{prefix}.pid;
-         {wait_for_sudo_spawn}
-         kill -USR1 \"$(cat /tmp/{prefix}.pid)\" || true;
-         {wait_for_sudo_exit}",
-        sudo_list = SUDO_PID_LIST
+        "rm -f {ready_file} {expected_file};
+         sh {launcher} sudo /bin/sh {target_script} &
+         {wait_ready}
+         kill -USR1 $! || true;
+         {wait_expected}
+         {wait_sudo_exit}",
+        wait_ready = wait_for(ready_file, "target not ready"),
+        wait_expected = wait_for(expected_file, "expected event did not occur"),
+        wait_sudo_exit = wait_for_sudo_exit(),
     );
 
     Command::new("sh")
@@ -446,97 +282,106 @@ fn assert_immediate_tty_close_after_sudo_spawn_cleans_sudo(
 
 #[test]
 fn closed_user_tty_sends_hup_to_command() {
-    if sudo_test::sudo_version() < sudo_test::ogsudo("1.9.18") {
+    if sudo_test::is_original_sudo() && sudo_test::sudo_version() < sudo_test::ogsudo("1.9.18") {
         return;
     }
 
-    let launcher_script = "/root/pty-launcher.sh";
-    let target_script = "/root/closed-tty-target.sh";
-    let ready_file = "/tmp/closed-tty-ready";
-    let hup_file = "/tmp/closed-tty-hup";
+    let target = "/root/closed-tty-target.sh";
+    let ready = "/tmp/closed-tty-ready";
+    let hup = "/tmp/closed-tty-hup";
 
     let env = Env([SUDOERS_ALL_ALL_NOPASSWD, "Defaults use_pty"])
-        .file(launcher_script, include_str!("use_pty/pty-launcher.sh"))
-        .file(target_script, include_str!("use_pty/closed-tty-target.sh"))
+        .file(
+            "/root/pty-launcher.sh",
+            include_str!("use_pty/pty-launcher.sh"),
+        )
+        .file(target, include_str!("use_pty/closed-tty-target.sh"))
         .build();
 
-    assert_closed_tty_sends_hup(
-        &env,
-        launcher_script,
-        target_script,
-        ready_file,
-        hup_file,
-        "closed-tty",
-    );
+    assert_closed_tty(&env, &format!("{target} {ready} {hup}"), ready, hup);
 }
 
 #[test]
 fn closed_user_tty_sends_hup_with_stdin_pipe() {
-    let launcher_script = "/root/pty-launcher.sh";
-    let target_script = "/root/closed-tty-target-pipe.sh";
-    let ready_file = "/tmp/closed-tty-pipe-ready";
+    let target = "/root/closed-tty-target.sh";
+    let ready = "/tmp/closed-tty-pipe-ready";
+    let hup = "/tmp/closed-tty-pipe-hup";
 
     let env = Env([SUDOERS_ALL_ALL_NOPASSWD, "Defaults use_pty"])
-        .file(launcher_script, include_str!("use_pty/pty-launcher.sh"))
         .file(
-            target_script,
-            include_str!("use_pty/closed-tty-target-pipe.sh"),
+            "/root/pty-launcher.sh",
+            include_str!("use_pty/pty-launcher.sh"),
         )
+        .file(target, include_str!("use_pty/closed-tty-target.sh"))
         .build();
 
-    assert_closed_tty_closes_sudo(
-        &env,
-        launcher_script,
-        target_script,
-        ready_file,
-        "closed-tty-pipe",
-    );
+    assert_closed_tty(&env, &format!("{target} {ready} {hup} pipe"), ready, hup);
 }
 
 #[test]
 fn closed_user_tty_before_ready_still_sends_hup() {
-    let launcher_script = "/root/pty-launcher.sh";
-    let target_script = "/root/closed-tty-target-early.sh";
-    let started_file = "/tmp/closed-tty-early-started";
-    let hup_file = "/tmp/closed-tty-early-hup";
+    let target = "/root/closed-tty-target.sh";
+    let started = "/tmp/closed-tty-early-started";
+    let hup = "/tmp/closed-tty-early-hup";
 
     let env = Env([SUDOERS_ALL_ALL_NOPASSWD, "Defaults use_pty"])
-        .file(launcher_script, include_str!("use_pty/pty-launcher.sh"))
         .file(
-            target_script,
-            include_str!("use_pty/closed-tty-target-early.sh"),
+            "/root/pty-launcher.sh",
+            include_str!("use_pty/pty-launcher.sh"),
         )
+        .file(target, include_str!("use_pty/closed-tty-target.sh"))
         .build();
 
-    assert_early_closed_tty_sends_hup(
+    assert_closed_tty(
         &env,
-        launcher_script,
-        target_script,
-        started_file,
-        hup_file,
-        "closed-tty-early",
+        &format!("{target} {started} {hup} early"),
+        started,
+        hup,
     );
 }
 
 #[test]
 fn closed_user_tty_right_after_sudo_spawn_sends_hup() {
-    let launcher_script = "/root/pty-launcher.sh";
-    let adapted_target = "/root/closed-tty-target-immediate.sh";
+    let target = "/root/closed-tty-target-immediate.sh";
+    let hup = "/tmp/closed-tty-immediate-hup";
 
     let env = Env([SUDOERS_ALL_ALL_NOPASSWD, "Defaults use_pty"])
-        .file(launcher_script, include_str!("use_pty/pty-launcher.sh"))
         .file(
-            adapted_target,
+            "/root/pty-launcher.sh",
+            include_str!("use_pty/pty-launcher.sh"),
+        )
+        .file(
+            target,
             "trap 'touch /tmp/closed-tty-immediate-hup; exit 0' HUP; while :; do sleep 0.1; done",
         )
         .build();
 
-    assert_immediate_tty_close_after_sudo_spawn_cleans_sudo(
-        &env,
-        launcher_script,
-        adapted_target,
-        "closed-tty-immediate",
+    // For the immediate case, we don't have a ready file - we close the tty
+    // as soon as sudo spawns. Use a custom command that waits for sudo to
+    // appear then sends SIGUSR1.
+    let command = format!(
+        "rm -f {hup};
+         sh /root/pty-launcher.sh sudo /bin/sh {target} &
+         # Wait for sudo to spawn
+         for _ in $(seq 1 {POLL_ATTEMPTS}); do
+             pidof sudo >/dev/null 2>&1 && break;
+             sleep 0.02;
+         done;
+         kill -USR1 $! || true;
+         {wait_hup}
+         {wait_sudo_exit}",
+        wait_hup = wait_for(
+            hup,
+            "command did not receive SIGHUP after immediate tty close"
+        ),
+        wait_sudo_exit = wait_for_sudo_exit(),
     );
+
+    Command::new("sh")
+        .args(["-c", &command])
+        .tty(true)
+        .output(&env)
+        .assert_success();
 }
 
 /// When the user's tty is closed, sudo must close (revoke) its own pty leader so
@@ -547,25 +392,22 @@ fn closed_user_tty_right_after_sudo_spawn_sends_hup() {
 /// indefinitely and the test times out — this is the key discriminator.
 #[test]
 fn closed_user_tty_revokes_pty_leader() {
-    let launcher_script = "/root/pty-launcher.sh";
-    let target_script = "/root/closed-tty-revoke-target.sh";
-    let ready_file = "/tmp/pty-revoke-ready";
-    let detected_file = "/tmp/pty-revoke-detected";
+    let target = "/root/closed-tty-revoke-target.sh";
+    let ready = "/tmp/pty-revoke-ready";
+    let detected = "/tmp/pty-revoke-detected";
 
     let env = Env([SUDOERS_ALL_ALL_NOPASSWD, "Defaults use_pty"])
-        .file(launcher_script, include_str!("use_pty/pty-launcher.sh"))
         .file(
-            target_script,
-            include_str!("use_pty/closed-tty-revoke-target.sh"),
+            "/root/pty-launcher.sh",
+            include_str!("use_pty/pty-launcher.sh"),
         )
+        .file(target, include_str!("use_pty/closed-tty-revoke-target.sh"))
         .build();
 
-    assert_closed_tty_sends_hup(
+    assert_closed_tty(
         &env,
-        launcher_script,
-        target_script,
-        ready_file,
-        detected_file,
-        "pty-revoke",
+        &format!("{target} {ready} {detected}"),
+        ready,
+        detected,
     );
 }
