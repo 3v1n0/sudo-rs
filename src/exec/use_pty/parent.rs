@@ -353,6 +353,8 @@ struct ParentClosure {
     original_signals: SignalsState,
     signal_stream: &'static SignalStream,
     signal_handlers: [SignalHandler; ParentClosure::SIGNALS.len()],
+    pty_revoked: bool,
+    pending_revoke_signal: bool,
 }
 
 impl ParentClosure {
@@ -407,6 +409,8 @@ impl ParentClosure {
             original_signals,
             signal_stream,
             signal_handlers,
+            pty_revoked: false,
+            pending_revoke_signal: false,
         })
     }
 
@@ -455,6 +459,15 @@ impl ParentClosure {
                     ParentMessage::CommandPid(pid) => {
                         dev_info!("received command PID ({pid}) from monitor");
                         self.command_pid = pid.into();
+                        if self.pending_revoke_signal
+                            && !self.pty_revoked
+                            && self.signal_revoke_pgrp()
+                        {
+                            if let Err(err) = self.tty_pipe.right_mut().close() {
+                                dev_warn!("cannot close pty leader: {err}");
+                            }
+                            self.pty_revoked = true;
+                        }
                     }
                     ParentMessage::CommandStatus(status) => {
                         // The command terminated or the monitor was not able to spawn it. We should stop
@@ -478,7 +491,9 @@ impl ParentClosure {
                                     self.schedule_signal(signal, registry);
                                 }
 
-                                self.tty_pipe.resume_events(registry);
+                                if !self.pty_revoked {
+                                    self.tty_pipe.resume_events(registry);
+                                }
                             }
                         }
                     }
@@ -552,6 +567,46 @@ impl ParentClosure {
                     }
                 }
             }
+        }
+    }
+
+    fn send_revoke_hup(&mut self, pgrp: ProcessId) -> bool {
+        dev_info!("sending {} to {pgrp}", signal_fmt(SIGHUP));
+        match killpg(pgrp, SIGHUP) {
+            Ok(()) => true,
+            Err(err) if err.raw_os_error() == Some(libc::ESRCH) => true,
+            Err(err) => {
+                dev_warn!("cannot send {} to {pgrp}: {err}", signal_fmt(SIGHUP));
+                false
+            }
+        }
+    }
+
+    fn signal_revoke_pgrp(&mut self) -> bool {
+        let Some(command_pid) = self.command_pid.filter(|pid| pid.inner() > 0) else {
+            self.pending_revoke_signal = true;
+            dev_warn!("tty revoked but no process group available to signal");
+            return false;
+        };
+        let command_pgrp = getpgid(command_pid).unwrap_or(command_pid);
+
+        if let Ok(tty_pgrp) = self.tty_pipe.right().tcgetpgrp() {
+            if tty_pgrp.inner() > 0 && tty_pgrp != command_pgrp {
+                self.send_revoke_hup(tty_pgrp);
+            }
+        }
+
+        let signaled = self.send_revoke_hup(command_pgrp);
+        self.pending_revoke_signal = !signaled;
+        signaled
+    }
+
+    fn revoke_pty(&mut self) {
+        if self.signal_revoke_pgrp() {
+            if let Err(err) = self.tty_pipe.right_mut().close() {
+                dev_warn!("cannot close pty leader: {err}");
+            }
+            self.pty_revoked = true;
         }
     }
 
@@ -791,12 +846,29 @@ impl Process for ParentClosure {
         match event {
             ParentEvent::Signal => self.on_signal(registry),
             ParentEvent::Tty(poll_event) => {
+                dev_info!("tty event: {poll_event:?}");
                 // Check if tty which existed is now gone.
                 if self.tty_pipe.left().tcgetsid().is_err() {
-                    dev_warn!("tty gone (closed/detached), ignoring future events");
                     self.tty_pipe.ignore_events(registry);
+                    if !self.pty_revoked {
+                        dev_warn!("tty gone (closed/detached), revoking pty");
+                        self.revoke_pty();
+                    }
                 } else {
-                    self.tty_pipe.on_left_event(poll_event, registry).ok();
+                    match self.tty_pipe.on_left_event(poll_event, registry) {
+                        Ok(()) => {}
+                        Err(err)
+                            if err.kind() == io::ErrorKind::Interrupted
+                                || err.kind() == io::ErrorKind::WouldBlock => {}
+                        Err(err) => {
+                            dev_warn!("tty event failed: {err}");
+                            self.tty_pipe.ignore_events(registry);
+                            if !self.pty_revoked {
+                                dev_warn!("tty I/O error ({err}), revoking pty");
+                                self.revoke_pty();
+                            }
+                        }
+                    }
                 }
             }
             ParentEvent::Pty(poll_event) => {
@@ -825,6 +897,8 @@ impl HandleSigchld for ParentClosure {
         if let Some(signal) = self.suspend_pty(signal, registry) {
             self.schedule_signal(signal, registry);
         }
-        self.tty_pipe.resume_events(registry);
+        if !self.pty_revoked {
+            self.tty_pipe.resume_events(registry);
+        }
     }
 }

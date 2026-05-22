@@ -538,3 +538,34 @@ fn closed_user_tty_right_after_sudo_spawn_sends_hup() {
         "closed-tty-immediate",
     );
 }
+
+/// When the user's tty is closed, sudo must close (revoke) its own pty leader so
+/// that the command's terminal becomes dead (EIO). This test verifies that by
+/// running a command that **ignores SIGHUP** and polls its terminal fd for EIO.
+///
+/// Without the pty-leader revoke fix the command's terminal stays alive
+/// indefinitely and the test times out — this is the key discriminator.
+#[test]
+fn closed_user_tty_revokes_pty_leader() {
+    let launcher_script = "/root/pty-launcher.sh";
+    let target_script = "/root/closed-tty-revoke-target.sh";
+    let ready_file = "/tmp/pty-revoke-ready";
+    let detected_file = "/tmp/pty-revoke-detected";
+
+    let env = Env([SUDOERS_ALL_ALL_NOPASSWD, "Defaults use_pty"])
+        .file(launcher_script, include_str!("use_pty/pty-launcher.sh"))
+        .file(
+            target_script,
+            include_str!("use_pty/closed-tty-revoke-target.sh"),
+        )
+        .build();
+
+    assert_closed_tty_sends_hup(
+        &env,
+        launcher_script,
+        target_script,
+        ready_file,
+        detected_file,
+        "pty-revoke",
+    );
+}

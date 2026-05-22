@@ -3,7 +3,7 @@ mod user_term;
 use std::{
     ffi::{CString, OsString, c_char, c_uchar},
     fmt,
-    fs::File,
+    fs::{File, OpenOptions},
     io,
     os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd},
     ptr::null_mut,
@@ -111,6 +111,16 @@ impl PtyLeader {
                 flags | libc::O_NONBLOCK,
             ))?;
         }
+        Ok(())
+    }
+
+    pub(crate) fn close(&mut self) -> io::Result<()> {
+        let replacement = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/null")?;
+        let old = std::mem::replace(&mut self.file, replacement);
+        drop(old);
         Ok(())
     }
 }
