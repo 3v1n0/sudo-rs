@@ -332,7 +332,7 @@ impl<'a> MonitorClosure<'a> {
                         self.command_pgrp
                     );
                 }
-                killpg(self.command_pgrp, SIGCONT).ok();
+                killpg(command_pid, SIGCONT).ok();
             }
             SIGCONT_BG => {
                 // Continue with the monitor as the foreground process group
@@ -342,11 +342,11 @@ impl<'a> MonitorClosure<'a> {
                         self.monitor_pgrp
                     );
                 }
-                killpg(self.command_pgrp, SIGCONT).ok();
+                killpg(command_pid, SIGCONT).ok();
             }
             signal => {
                 // Send the signal to the command.
-                killpg(self.command_pgrp, signal).ok();
+                killpg(command_pid, signal).ok();
             }
         }
     }

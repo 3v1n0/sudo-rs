@@ -102,14 +102,7 @@ impl<L: Read + Write + AsFd, R: Read + Write + AsFd> Pipe<L, R> {
         registry: &mut EventRegistry<T>,
     ) -> io::Result<()> {
         match poll_event {
-            PollEvent::Readable => {
-                let inserted = self.buffer_lr.read(&mut self.left, registry)?;
-                if inserted == 0 {
-                    Err(io::ErrorKind::UnexpectedEof.into())
-                } else {
-                    Ok(())
-                }
-            }
+            PollEvent::Readable => self.buffer_lr.read(&mut self.left, registry),
             PollEvent::Writable => {
                 if self.buffer_rl.write(&mut self.left, registry)? {
                     self.buffer_rl.read_handle.resume(registry);
@@ -126,10 +119,7 @@ impl<L: Read + Write + AsFd, R: Read + Write + AsFd> Pipe<L, R> {
         registry: &mut EventRegistry<T>,
     ) -> io::Result<()> {
         match poll_event {
-            PollEvent::Readable => {
-                self.buffer_rl.read(&mut self.right, registry)?;
-                Ok(())
-            }
+            PollEvent::Readable => self.buffer_rl.read(&mut self.right, registry),
             PollEvent::Writable => {
                 if self.buffer_lr.write(&mut self.right, registry)? && !self.background {
                     self.buffer_lr.read_handle.resume(registry);
@@ -199,26 +189,22 @@ impl<R: Read, W: Write> Buffer<R, W> {
         &mut self,
         read: &mut R,
         registry: &mut EventRegistry<T>,
-    ) -> io::Result<usize> {
+    ) -> io::Result<()> {
         // If the buffer is full, there is nothing to be read.
         if self.internal.is_full() {
             self.read_handle.ignore(registry);
-            return Ok(0);
+            return Ok(());
         }
 
         // Read bytes and insert them into the buffer.
         let inserted_len = self.internal.insert(read)?;
 
-        // EOF, stop polling this source.
-        if inserted_len == 0 {
-            self.read_handle.ignore(registry);
-            return Ok(0);
+        // If we inserted something, the buffer is not empty anymore and we can resume writing.
+        if inserted_len > 0 {
+            self.write_handle.resume(registry);
         }
 
-        // If we inserted something, the buffer is not empty anymore and we can resume writing.
-        self.write_handle.resume(registry);
-
-        Ok(inserted_len)
+        Ok(())
     }
 
     /// Write bytes from the buffer.

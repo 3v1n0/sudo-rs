@@ -5,7 +5,7 @@ use std::{
     os::fd::{AsFd, AsRawFd, RawFd},
 };
 
-use libc::{POLLERR, POLLHUP, POLLIN, POLLNVAL, POLLOUT, pollfd};
+use libc::{POLLIN, POLLOUT, pollfd};
 
 use crate::common::{HARDENED_ENUM_VALUE_0, HARDENED_ENUM_VALUE_1};
 use crate::{cutils::cerr, log::dev_debug};
@@ -194,9 +194,7 @@ impl<T: Process> EventRegistry<T> {
         // Remove the ids that correspond to file descriptors that were not ready.
         for (i, fd) in fds.iter().enumerate().rev() {
             let events = fd.events & fd.revents;
-            let io_ready = (events & POLLIN != 0) || (events & POLLOUT != 0);
-            let hup_or_error = fd.revents & (POLLHUP | POLLERR | POLLNVAL) != 0;
-            if !(io_ready || hup_or_error) {
+            if !((events & POLLIN != 0) || (events & POLLOUT != 0)) {
                 ids.remove(i);
             }
         }
